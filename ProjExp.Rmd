@@ -1,0 +1,297 @@
+---
+title: "DOGE Project Exploration"
+author: "Peter Ashley"
+date: "5/8/25"
+output: github_document
+---
+
+```{r libraries}
+library(tidyverse)
+library(rvest)
+library(dplyr)
+library(httr)
+library(jsonlite)
+library(purrr)
+source("ReadFPDS.R")
+```
+
+# Exploration Part 1, getting DOGE data
+
+## Getting the initial page information and number of contracts
+Idea of data obtained from:
+https://www.reddit.com/r/dataisbeautiful/comments/1jl3own/doge_preferentially_cancelled_grants_and/
+https://bsky.app/profile/airmovingdevice.bsky.social/post/3ll2ehugqik2n
+
+Data obtained from:
+https://api.doge.gov/docs#/Savings/get_ContractSavings
+
+```{r get-contract-count}
+response <- GET("https://api.doge.gov/savings/contracts?sort_by=savings&sort_order=desc&per_page=100&page=1")
+data <- content(response, as = "text", encoding="UTF-8")
+parsed_data <- fromJSON(data)
+page_count <- parsed_data$meta$pages
+```
+
+Here, we find that we have `r page_count` pages of data
+
+## Collect all contracts from DOGE API
+
+```{r get-contracts}
+all_results <- list()
+for (i in 1:page_count) {
+  #break # !!!REMOVE TO RE-GET ALL PAGES FROM API!!!
+  #Sys.sleep(0.25)
+  link <- paste0("https://api.doge.gov/savings/contracts?sort_by=savings&sort_order=asc&per_page=100&page=", i)
+  i_response <- GET(link)
+  i_data <- fromJSON(content(i_response, as = "text", encoding="UTF-8"))
+  all_results[i] <- i_data$result
+}
+```
+
+## Combine DOGE data into one dataframe
+
+```{r combine-data}
+# For some reason rbind itself concats subframes into one row of frames
+# instead of putting columns and stacking rows, needs do.call() wrapping to fix
+combined_data <- do.call(rbind, all_results)
+```
+
+## Remove rows with no link or basic fpds.gov link
+
+```{r clean-data}
+clean_data <- combined_data %>%
+  mutate(
+    # If link is blank or basic, valid = N, else valid = Y
+    valid = ifelse(fpds_link == "" | fpds_link == "https://fpds.gov", "N", "Y")
+  ) 
+
+# remove all non-Y values, then delete the newly added valid column
+clean_data <- subset(clean_data, clean_data$valid == "Y") %>%
+  select(!(valid))
+```
+
+## Write DOGE data to CSV file
+
+```{r write-doge-data}
+#write.csv(clean_data, "contracts.csv")
+```
+
+# Exploration Part 2, obtaining URL info
+
+```{r read-doge-data}
+contracts <- read_csv("contracts.csv")
+contracts <- contracts[-c(1)] # Remove extra index column added by read_csv()
+```
+
+## How to pull parameters with parse_url()
+
+```{r get-contract-type}
+# Encountered issues with strsplit, 
+# ended up finding urltools param_get(), but couldnt get that to work either,
+# simplest answer turned out to be httr parse_url(), but has weird syntax
+contracts %>%
+  mutate(
+    contract_type = map_chr(fpds_link, ~ parse_url(.)$query$contractType),
+    piid2 = map_chr(fpds_link, ~ parse_url(.)$query$PIID)
+  )
+```
+
+## Use parse_url to separate all parts of the links
+
+```{r parse-urls}
+# Note: IDV means Indefinite Delivery Vehicle
+contracts <- contracts %>%
+  mutate(
+    contract_type = map_chr(fpds_link, ~ parse_url(.)$query$contractType),
+    piid2 = map_chr(fpds_link, ~ parse_url(.)$query$PIID),
+    agencyID = map_chr(fpds_link, ~ parse_url(.)$query$agencyID),
+    modNumber = map_chr(fpds_link, ~ parse_url(.)$query$modNumber),
+    idvAgencyID = map_chr(fpds_link, ~ parse_url(.)$query$idvAgencyID),
+    idvPIID = map_chr(fpds_link, ~ parse_url(.)$query$idvPIID)
+  )
+contracts
+```
+
+## Define 'key values' of links as PIID and idvPIID
+
+```{r distinct-link-parts}
+contracts %>%
+  group_by(fpds_link) %>%
+  count() %>%
+  arrange(desc(n))%>%
+  ungroup() %>%
+  count() %>% 
+  rename(fpds_link = n)
+
+contracts %>%
+  group_by(piid) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  ungroup() %>%
+  count() %>% 
+  rename(piid = n)
+
+contracts %>%
+  group_by(idvPIID) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  ungroup() %>%
+  count() %>% 
+  rename(idvPIID = n)
+
+contracts %>%
+  group_by(piid, idvPIID) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  ungroup() %>%
+  count() %>% 
+  rename("piid, idvPIID" = n)
+
+contracts %>%
+  group_by(fpds_link, piid, idvPIID) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  ungroup() %>%
+  count() %>% 
+  rename("fpds_link, piid, idvPIID" = n)
+```
+
+## Contract Type Analysis
+
+```{r contract-type}
+contracts %>%
+  group_by(contract_type) %>%
+  count()
+```
+
+## Look at idvAgencyID
+Most rows have no value, but `r contracts %>% filter(idvAgencyID != "") %>% count()` awards do?
+I'm not using this further, but found it interesting
+
+```{r idv-agency-id}
+contracts %>% 
+  filter(idvAgencyID != "") %>%
+  group_by(idvAgencyID) %>%
+  count()
+
+contracts %>%
+  group_by(idvAgencyID, contract_type) %>%
+  count()
+```
+
+## Multiple duplicate links
+Found `r contracts %>% group_by(piid, idvPIID) %>% count() %>% arrange(desc(n)) %>% filter(n > 1) %>% ungroup() %>% count()` rows with the same link,
+meaning they have the same PIID, idvPIID, modNumber, etc.
+
+```{r duplicate-links}
+contracts %>%
+  group_by(fpds_link) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  filter(n > 1)
+
+contracts %>%
+  group_by(piid, idvPIID) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  filter(n > 1)
+```
+
+# Exploration Part 3, obtaining FPDS data
+
+### Basic fpds HTML reading
+Here, I am learning how to interact with the FPDS links, 
+and figuring out nodes and ids for the form
+
+```{r testing-fpds-scraping}
+reasons <- ""
+for (link in contracts$fpds_link){
+  #reasons <- paste0(reasons, scrape_fpds(link))
+  test <- read_page(link)
+  break
+}
+
+page_data <- read_html(link)
+  
+reasonForModification <- page_data %>%
+  html_node("#reasonForModification") %>%
+  html_attr("value")
+
+reasonForModification
+```
+
+## This was a major process, first deciding which columns I wanted:
+Most of these are numeric, with reason_for_modification as an outlier
+I also conisdered date and location variables, but only selected numeric values.
+
+```{r fpds-column-info}
+ncol(blank_fpds())
+names(blank_fpds())
+```
+
+## Running the scraper
+First attempt failed:
+Was missing error detection, scraped ~500 links and script crashed
+
+Second attempt failed:
+Added error detection, scraped ~3000 links and posit.cloud crashed
+
+Third attempt worked:
+Changed append method to bind_rows() on a dataframe
+Added "Catching Up" mechanism at beginning to not overwrite data
+
+```{r scrape-data}
+base_page <- blank_fpds()
+#results <- base_page !!!UNCOMMENT TO RUN AGAIN!!!
+
+#max_i = nrow(results) !!!UNCOMMENT TO RUN AGAIN!!!
+i <- 1
+for (link in contracts$fpds_link){
+  break             # !!!COMMENT OUT TO RUN AGAIN!!!
+  if (i <= max_i && nrow(results) != 1) {
+    if (i %% 10 == 0){ #Check in every 10, comment out to check in each time
+      print(paste0("Catching up, ", i, "/", max_i))
+    }
+  }
+  else {
+    result <- tryCatch({
+      fpds <- read_page(link)
+    }, error = function(e) {
+      result <- tryCatch({
+        id <- parse_url(link)$query$PIID
+        print(paste0("ERROR OCCURED: ROW: ", i, "; PIID: ", id, "; ERROR MESSAGE: ", e, ". TRYING AGAIN IN 5 SECONDS.")) 
+        
+        Sys.sleep(5) #Wait 5 seconds to give the site a chance to catch up
+        fpds <- read_page(link) #Try again
+      }, error = function(err) {
+        #Was frequently getting XMLread errors 100-400 rows in, just wanted to run
+        id <- parse_url(link)$query$PIID
+        idv_id <- parse_url(link)$query$idvPIID
+        print(paste0("KILLER ERROR OCCURED: ROW: ", i, "; PIID: ", id, "; IDV_ID: ", idv_id, "; ERROR MESSAGE: ", err)) 
+        
+        fpds <- blank_fpds() #Blank data for rows that fail twice
+        fpds["piid"] <- id
+        fpds["idv_piid"] <- idv_id
+      })
+    })
+    
+    results <- bind_rows(results, fpds)
+    Sys.sleep(0.1)
+    #if (i %% 10 == 0){ #Check in every 10, comment out to check in each time
+    print(paste0(i, ": ", floor((i / nrow(contracts)) * 1000) / 10, "%;  ", fpds$piid))
+    #}
+    if (i == 1){
+      #Convert to a dataframe (removing first empty row)
+      results <- as.data.frame(results)[-1,] 
+    }
+  }
+  
+  i = i + 1
+}
+```
+
+## Write FPDS data to a csv file
+
+```{r write-fpds-data}
+#write.csv(fpds_contracts, "fpds.csv")
+```
